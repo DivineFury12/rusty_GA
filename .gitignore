@@ -1,0 +1,38 @@
+# === Rust / Cargo ===
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# If this is a binary-only project, uncomment:
+# Cargo.lock
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.bak
+
+# === OS generated ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Logs ===
+*.log
+
+# === Environment files ===
+.env
+.env.*
+
+# === Build output ===
+*.exe
+*.out
+*.app
+
+# === Temporary files ===
+tmp/
+temp/
+
+best.csv

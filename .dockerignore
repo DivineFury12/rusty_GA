@@ -1,0 +1,6 @@
+.git
+target
+.gitignore
+**/*.rs.bk
+src/main_parallel.rs
+best.csv
