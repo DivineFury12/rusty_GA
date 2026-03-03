@@ -1,31 +1,16 @@
-# ---------- Build stage ----------
-FROM rust:latest AS builder
+FROM rust:latest
 
 WORKDIR /app
 
+# Copy dependency manifests first (for better caching)
 COPY Cargo.toml ./
 
-# Cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-RUN rm -rf src
-
-# Copy real source
+# Copy source code and data files
 COPY src ./src
 COPY *.csv ./
 
-# Final build
+# Build the release binary (caches dependencies)
 RUN cargo build --release
 
-
-# ---------- Runtime stage ----------
-FROM debian:bookworm-slim
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/target/release/rusty_GA ./rusty_GA
-COPY *.csv ./
-
-CMD ["./rusty_GA"]
+# Run the program using cargo run --release
+CMD ["cargo", "run", "--release"]
