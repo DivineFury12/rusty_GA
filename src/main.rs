@@ -22,7 +22,6 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use std::cmp::{max, min, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -43,7 +42,6 @@ use serde::Deserialize;
 const VISIT_COST: u32 = 100;
 const HERO_COST:  u32 = 2500;
 const MAX_DAY:    u32 = 7;
-const MAX_HEROES: u32 = 100;
 
 // ─── Progress-bar styles ─────────────────────────────────────────────────────
 
@@ -80,8 +78,8 @@ fn post_bar_style() -> ProgressStyle {
 
 // ─── CSV deserialisation structs ──────────────────────────────────────────────
 
-#[derive(Deserialize)] struct ObjectRecord  { object_id: u32, day_open: u32, reward: u32 }
-#[derive(Deserialize)] struct HeroRecord    { hero_id: u32, move_points: u32 }
+#[derive(Deserialize)] struct ObjectRecord    { object_id: u32, day_open: u32, reward: u32 }
+#[derive(Deserialize)] struct HeroRecord      { hero_id: u32, move_points: u32 }
 #[derive(Deserialize)] struct DistStartRecord { object_id: u32, dist_start: u32 }
 
 // ─── Domain structs ───────────────────────────────────────────────────────────
@@ -89,34 +87,40 @@ fn post_bar_style() -> ProgressStyle {
 #[derive(Clone)] struct Mill { day_open: u32, reward: u32 }
 #[derive(Clone)] struct Hero { move_points: u32 }
 
-/// GA individual.
-///
-/// `hero_rewards` caches `simulate_hero()` output per hero so local-search
-/// moves that touch only one or two heroes update fitness in O(1) instead of
-/// re-simulating the entire solution.
+// ─── Solution ─────────────────────────────────────────────────────────────────
+//
+// KEY DESIGN: each Route owns its hero_id so the MP lookup in simulate_hero is
+// always stable.  No renumbering is ever performed — removing a route is a plain
+// Vec::swap_remove.  Hero identity is never confused with slot index.
+//
+// fitness = Σ route.reward  −  routes.len() × HERO_COST
+
+#[derive(Clone)]
+struct Route {
+    hero_id: u32,      // actual hero from d.heroes (determines move_points)
+    mills:   Vec<u32>, // ordered mill visits (sorted by day_open)
+    reward:  u32,      // cached simulate_hero result
+}
+
 #[derive(Clone)]
 struct Solution {
-    max_id:       u32,
-    routes:       HashMap<u32, Vec<u32>>, // hero_id → ordered object_ids
-    hero_rewards: HashMap<u32, u32>,      // hero_id → cached on-time reward
-    fitness:      Option<i64>,            // Σ rewards  −  max_id × HERO_COST
+    routes:  Vec<Route>,
+    fitness: i64,
 }
 
-// ─── Problem data (shared, read-only) ────────────────────────────────────────
+// ─── Problem data ─────────────────────────────────────────────────────────────
 
 struct ProblemData {
-    heroes:      HashMap<u32, Hero>,
-    mills:       HashMap<u32, Mill>,
-    /// Flat distance matrix: (n_mills+1) × (n_mills+1), index 0 = castle.
-    dist:        Array2<u32>,
-    /// Mills grouped by day_open for fast greedy / crossover access.
-    mills_by_day: [Vec<u32>; 8], // index 0 unused, [1..=7] hold mill ids
-    /// All mill ids sorted for deterministic iteration.
-    mill_ids:    Vec<u32>,
-    n_mills:     usize,
+    heroes:       HashMap<u32, Hero>,
+    mills:        HashMap<u32, Mill>,
+    dist:         Array2<u32>,
+    mills_by_day: [Vec<u32>; 8],
+    mill_ids:     Vec<u32>,
+    /// Hero ids sorted by move_points descending — we prefer high-MP heroes.
+    hero_ids_by_mp: Vec<u32>,
+    n_mills:      usize,
 }
 
-// Array2<u32> and HashMap are Send; we only ever read after construction.
 unsafe impl Sync for ProblemData {}
 
 // ─── Data loading ─────────────────────────────────────────────────────────────
@@ -178,29 +182,31 @@ fn load_data(mp: &MultiProgress) -> ProblemData {
     let mut mill_ids: Vec<u32> = mills.keys().copied().collect();
     mill_ids.sort_unstable();
 
-    // Pre-group mills by day_open
     let mut mills_by_day: [Vec<u32>; 8] = Default::default();
     for &id in &mill_ids { mills_by_day[mills[&id].day_open as usize].push(id); }
 
-    sp.finish_with_message(format!("✓ Loaded  {} mills  {} heroes", n_mills, heroes.len()));
+    // Sort hero ids by MP descending so greedy/init always picks the best heroes first
+    let mut hero_ids_by_mp: Vec<u32> = heroes.keys().copied().collect();
+    hero_ids_by_mp.sort_by(|&a, &b| {
+        heroes[&b].move_points.cmp(&heroes[&a].move_points).then(a.cmp(&b))
+    });
 
-    ProblemData { heroes, mills, dist, mills_by_day, mill_ids, n_mills }
+    sp.finish_with_message(format!("✓ Loaded  {} mills  {} heroes", n_mills, heroes.len()));
+    ProblemData { heroes, mills, dist, mills_by_day, mill_ids, hero_ids_by_mp, n_mills }
 }
 
 // ─── Simulation ───────────────────────────────────────────────────────────────
 
-/// Simulate hero travelling `route`. Returns the total on-time reward.
 #[inline]
 fn simulate_hero(hero_id: u32, route: &[u32], d: &ProblemData) -> u32 {
     if route.is_empty() { return 0; }
-    let mp_full   = d.heroes[&hero_id].move_points;
-    let mut day   = 1u32;
-    let mut rem   = mp_full;
-    let mut pos   = 0u32;
+    let mp_full = d.heroes[&hero_id].move_points;
+    let mut day = 1u32;
+    let mut rem = mp_full;
+    let mut pos = 0u32;
     let mut total = 0u32;
 
     for &mid in route {
-        // ── Travel (may span multiple days) ───────────────────────────────
         let mut dist = d.dist[[pos as usize, mid as usize]];
         loop {
             if rem >= dist { rem -= dist; break; }
@@ -209,13 +215,9 @@ fn simulate_hero(hero_id: u32, route: &[u32], d: &ProblemData) -> u32 {
             if day > MAX_DAY { return total; }
             rem = mp_full;
         }
-
-        // ── Wait at early arrival ─────────────────────────────────────────
         let mill = &d.mills[&mid];
         if day < mill.day_open { day = mill.day_open; rem = mp_full; }
         if day > MAX_DAY { return total; }
-
-        // ── Visit (last-move rule: 1 MP suffices) ────────────────────────
         if rem == 0 { pos = mid; continue; }
         rem = rem.saturating_sub(VISIT_COST);
         if day == mill.day_open { total += mill.reward; }
@@ -224,83 +226,88 @@ fn simulate_hero(hero_id: u32, route: &[u32], d: &ProblemData) -> u32 {
     total
 }
 
-// ─── Cached-fitness helpers ───────────────────────────────────────────────────
+// ─── Solution helpers ─────────────────────────────────────────────────────────
 
-/// Recompute reward for a single hero and update the fitness delta.
-/// O(route_len) — much cheaper than full recompute when only one route changed.
-fn refresh_hero(sol: &mut Solution, hid: u32, d: &ProblemData) {
-    let route   = sol.routes.get(&hid).map_or(&[] as &[u32], |v| v.as_slice());
-    let new_rew = if hid <= sol.max_id { simulate_hero(hid, route, d) } else { 0 };
-    let old_rew = sol.hero_rewards.insert(hid, new_rew).unwrap_or(0);
-    if let Some(f) = sol.fitness.as_mut() { *f += new_rew as i64 - old_rew as i64; }
+fn make_solution(routes: Vec<Route>) -> Solution {
+    let gross: i64 = routes.iter().map(|r| r.reward as i64).sum();
+    let cost:  i64 = routes.len() as i64 * HERO_COST as i64;
+    Solution { fitness: gross - cost, routes }
 }
 
-/// Full recompute from scratch — used after structural changes (max_id change, crossover).
+/// Recompute all route rewards and fitness from scratch.
 fn recompute(sol: &mut Solution, d: &ProblemData) {
-    sol.hero_rewards.clear();
-    let mut total = 0i64;
-    for hid in 1..=sol.max_id {
-        let r   = sol.routes.get(&hid).map_or(&[] as &[u32], |v| v.as_slice());
-        let rew = simulate_hero(hid, r, d);
-        sol.hero_rewards.insert(hid, rew);
-        total += rew as i64;
+    let mut gross = 0i64;
+    for r in &mut sol.routes {
+        r.reward = simulate_hero(r.hero_id, &r.mills, d);
+        gross += r.reward as i64;
     }
-    sol.fitness = Some(total - sol.max_id as i64 * HERO_COST as i64);
+    sol.fitness = gross - sol.routes.len() as i64 * HERO_COST as i64;
 }
 
-// ─── Solution construction helpers ───────────────────────────────────────────
-
-fn empty_routes(max_id: u32) -> HashMap<u32, Vec<u32>> {
-    (1..=max_id).map(|i| (i, Vec::new())).collect()
+/// Re-simulate one route in-place and update fitness delta — O(route_len).
+#[inline]
+fn refresh_route(sol: &mut Solution, idx: usize, d: &ProblemData) {
+    let old = sol.routes[idx].reward;
+    let new = simulate_hero(sol.routes[idx].hero_id, &sol.routes[idx].mills, d);
+    sol.routes[idx].reward = new;
+    sol.fitness += new as i64 - old as i64;
 }
 
-fn make_solution(max_id: u32, routes: HashMap<u32, Vec<u32>>, d: &ProblemData) -> Solution {
-    let mut sol = Solution { max_id, routes, hero_rewards: HashMap::new(), fitness: None };
-    recompute(&mut sol, d);
-    sol
+/// All mills currently assigned in a solution.
+fn visited_set(sol: &Solution) -> HashSet<u32> {
+    sol.routes.iter().flat_map(|r| r.mills.iter().copied()).collect()
+}
+
+/// Heroes in use.
+fn used_heroes(sol: &Solution) -> HashSet<u32> {
+    sol.routes.iter().map(|r| r.hero_id).collect()
 }
 
 // ─── Greedy initialisation ────────────────────────────────────────────────────
 //
-// Strategy: for each hero, repeatedly pick the unassigned mill with the lowest
-// combined cost:  distance_from_current  +  wait_days × move_points.
-// This naturally groups same-day mills on the same hero and avoids late arrivals.
+// Picks `n_heroes` heroes (preferring high-MP) and builds routes greedily:
+// nearest unassigned mill by  dist + wait_days × move_points.
 
-fn greedy_solution(d: &ProblemData, rng: &mut impl Rng) -> Solution {
-    // Data analysis: optimal hero count is 18-23 for this instance.
-    // Below 18 → can't cover 700 mills; above 23 → hero cost exceeds marginal gain.
-    let max_id     = rng.gen_range(18u32..=23);
-    let mut routes = empty_routes(max_id);
-    let mut done   = HashSet::<u32>::new();
+fn greedy_solution(n_heroes: usize, d: &ProblemData, rng: &mut impl Rng) -> Solution {
+    // Choose n_heroes from the top of hero_ids_by_mp with a small random shuffle
+    // among heroes of equal MP so we don't always pick the exact same set.
+    let mut candidates = d.hero_ids_by_mp.clone();
+    // Shuffle within equal-MP tiers to vary the hero selection
+    candidates.chunks_mut(1).for_each(|_| {}); // no-op; real shuffle below
+    candidates.shuffle(rng);
+    // But re-sort by MP (stable) so high-MP heroes are still preferred
+    candidates.sort_by_key(|&h| std::cmp::Reverse(d.heroes[&h].move_points));
+    let chosen: Vec<u32> = candidates.into_iter().take(n_heroes).collect();
 
-    for hid in 1..=max_id {
-        let mp         = d.heroes[&hid].move_points;
-        let mut pos    = 0u32;
-        let mut day    = 1u32;
-        let mut rem    = mp;
+    let mut done: HashSet<u32> = HashSet::new();
+    let mut routes: Vec<Route> = Vec::with_capacity(n_heroes);
+
+    for &hero_id in &chosen {
+        let mp = d.heroes[&hero_id].move_points;
+        let mut pos = 0u32;
+        let mut day = 1u32;
+        let mut rem = mp;
+        let mut mills: Vec<u32> = Vec::new();
 
         loop {
-            // Nearest feasible unassigned mill
             let best = d.mill_ids.iter()
                 .filter(|&&id| !done.contains(&id))
                 .filter_map(|&id| {
-                    let mill       = &d.mills[&id];
-                    let dist       = d.dist[[pos as usize, id as usize]];
-                    let days_move  = if dist <= rem { 0 } else { 1 + (dist - rem + mp - 1) / mp };
-                    let arrive_day = day + days_move;
-                    let visit_day  = arrive_day.max(mill.day_open);
+                    let mill      = &d.mills[&id];
+                    let dist      = d.dist[[pos as usize, id as usize]];
+                    let days_move = if dist <= rem { 0 } else { 1 + (dist - rem + mp - 1) / mp };
+                    let arrive    = day + days_move;
+                    let visit_day = arrive.max(mill.day_open);
                     if visit_day > MAX_DAY { return None; }
-                    let wait = mill.day_open.saturating_sub(arrive_day);
+                    let wait = mill.day_open.saturating_sub(arrive);
                     Some((dist + wait * mp, id, visit_day))
                 })
                 .min_by_key(|&(score, _, _)| score);
 
             let (_, mid, visit_day) = match best { None => break, Some(v) => v };
-
             done.insert(mid);
-            routes.get_mut(&hid).unwrap().push(mid);
+            mills.push(mid);
 
-            // Advance simulation state
             let mut dl = d.dist[[pos as usize, mid as usize]];
             loop {
                 if rem >= dl { rem -= dl; break; }
@@ -311,311 +318,323 @@ fn greedy_solution(d: &ProblemData, rng: &mut impl Rng) -> Solution {
             pos = mid;
             day = visit_day;
         }
+
+        let reward = simulate_hero(hero_id, &mills, d);
+        routes.push(Route { hero_id, mills, reward });
     }
 
-    make_solution(max_id, routes, d)
+    make_solution(routes)
 }
 
-// ─── Randomised solution ──────────────────────────────────────────────────────
-//
-// Assign a random 60-100% subset of mills to random heroes.
-// Keeping a subset means some mills are left for other individuals —
-// genetic diversity benefits from incomplete solutions early on.
+// ─── Random initialisation ────────────────────────────────────────────────────
 
-fn random_solution(d: &ProblemData, rng: &mut impl Rng) -> Solution {
-    // Slightly wider than greedy to maintain diversity, but still data-informed.
-    let max_id     = rng.gen_range(17u32..=26);
-    let mut routes = empty_routes(max_id);
-    let mut mills  = d.mill_ids.clone();
-    mills.shuffle(rng);
-    let take = rng.gen_range(mills.len() * 6 / 10..=mills.len());
-    for &m in &mills[..take] {
-        let h = rng.gen_range(1..=max_id);
-        routes.get_mut(&h).unwrap().push(m);
+fn random_solution(n_heroes: usize, d: &ProblemData, rng: &mut impl Rng) -> Solution {
+    let mut hids = d.hero_ids_by_mp.clone();
+    hids.shuffle(rng);
+    let chosen: Vec<u32> = hids.into_iter().take(n_heroes).collect();
+
+    let mut all_mills = d.mill_ids.clone();
+    all_mills.shuffle(rng);
+    let take = rng.gen_range(all_mills.len() * 6 / 10..=all_mills.len());
+
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_heroes];
+    for &m in &all_mills[..take] {
+        buckets[rng.gen_range(0..n_heroes)].push(m);
     }
-    make_solution(max_id, routes, d)
+
+    let routes: Vec<Route> = chosen.into_iter().zip(buckets).map(|(hero_id, mut mills)| {
+        mills.sort_by_key(|&m| d.mills[&m].day_open);
+        let reward = simulate_hero(hero_id, &mills, d);
+        Route { hero_id, mills, reward }
+    }).collect();
+
+    make_solution(routes)
 }
 
-// ─── Population init (parallel) ───────────────────────────────────────────────
+// ─── Population init ──────────────────────────────────────────────────────────
 
-fn init_population(pop_size: usize, d: &ProblemData, mp: &MultiProgress) -> Vec<Solution> {
+fn init_population(
+    pop_size:    usize,
+    d:           &ProblemData,
+    mp:          &MultiProgress,
+    checkpoints: &[&str],
+) -> Vec<Solution> {
     let pb = mp.add(ProgressBar::new(pop_size as u64));
     pb.set_style(bar_style());
     pb.set_message("Initialising population");
 
-    let greedy_count = (pop_size * 30 / 100).max(1); // 30% greedy seeds
+    let greedy_count = (pop_size * 40 / 100).max(1);
 
     let mut pop: Vec<Solution> = (0..pop_size)
         .into_par_iter()
         .map(|i| {
             let mut rng = rand::thread_rng();
-            let sol = if i < greedy_count { greedy_solution(d, &mut rng) }
-                      else                { random_solution(d, &mut rng)  };
+            // Vary hero count around the data-proven sweet spot (20-24)
+            let n = rng.gen_range(20usize..=24);
+            let sol = if i < greedy_count {
+                greedy_solution(n, d, &mut rng)
+            } else {
+                let n2 = rng.gen_range(19usize..=26);
+                random_solution(n2, d, &mut rng)
+            };
             pb.inc(1);
             sol
         })
         .collect();
 
-    // Seed the very best greedy solution deterministically on a single thread
-    // so we always start with at least one high-quality individual.
-    let mut seed_rng = rand::thread_rng();
-    let seed = greedy_solution(d, &mut seed_rng);
-    pop.push(seed);
+    // Inject checkpoints
+    let mut ckpt_count = 0usize;
+    for &path in checkpoints {
+        if let Some(ckpt) = load_checkpoint(path, d) {
+            // Replace worst individual
+            if let Some(i) = pop.iter().enumerate()
+                .min_by_key(|(_, s)| s.fitness).map(|(i, _)| i)
+            {
+                pop[i] = ckpt;
+                ckpt_count += 1;
+            }
+        }
+    }
 
     pb.finish_with_message(format!(
-        "✓ Pop {pop_size}  ({greedy_count} greedy + {} random + 1 seed)",
-        pop_size - greedy_count
+        "✓ Pop {}  ({} greedy + {} random + {} checkpoints)",
+        pop.len(), greedy_count, pop_size - greedy_count, ckpt_count
     ));
     pop
 }
 
-// ─── Tournament selection ────────────────────────────────────────────────────
+// ─── Checkpoint loading ───────────────────────────────────────────────────────
+//
+// Reads a hero_id,object_id CSV and reconstructs a Solution.
+// Each row's hero_id is used directly as the route's hero_id so the correct
+// move_points is always used for simulation.
+
+fn load_checkpoint(path: &str, d: &ProblemData) -> Option<Solution> {
+    let file = match File::open(path) {
+        Ok(f)  => f,
+        Err(_) => { eprintln!("  [ckpt] {path} not found, skipping"); return None; }
+    };
+
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    for result in rdr.deserialize::<(u32, u32)>() {
+        let (hero_id, object_id) = match result {
+            Ok(r) => r,
+            Err(e) => { eprintln!("  [ckpt] parse error: {e}"); return None; }
+        };
+        if d.mills.contains_key(&object_id) && d.heroes.contains_key(&hero_id) {
+            map.entry(hero_id).or_default().push(object_id);
+        }
+    }
+
+    if map.is_empty() { return None; }
+
+    let routes: Vec<Route> = map.into_iter().map(|(hero_id, mut mills)| {
+        mills.sort_by_key(|&m| d.mills[&m].day_open);
+        let reward = simulate_hero(hero_id, &mills, d);
+        Route { hero_id, mills, reward }
+    }).collect();
+
+    let sol = make_solution(routes);
+    eprintln!("  [ckpt] {path}  fitness={}  heroes={}  mills={}",
+        sol.fitness, sol.routes.len(),
+        sol.routes.iter().map(|r| r.mills.len()).sum::<usize>());
+    Some(sol)
+}
+
+// ─── Tournament selection ─────────────────────────────────────────────────────
 
 fn tournament<'a>(pop: &'a [Solution], k: usize, rng: &mut impl Rng) -> &'a Solution {
-    pop.choose_multiple(rng, k)
-        .max_by_key(|s| s.fitness.unwrap_or(i64::MIN))
-        .unwrap()
+    pop.choose_multiple(rng, k).max_by_key(|s| s.fitness).unwrap()
 }
 
 // ─── Crossover ────────────────────────────────────────────────────────────────
 //
-// Two strategies used in a 60/40 split:
+// Day-aware crossover: for each day 1..=7 flip a coin to pick donor parent.
+// Inherit all mills of that day from that parent, preserving the donor's
+// hero assignment.  Deduplication ensures no mill appears twice.
 //
-// 1. Day-aware crossover (60%):
-//    For each day 1..7, flip a coin to pick the "donor" parent.
-//    Inherit all mills of that day from the donor, preserving hero assignment.
-//    Sort each hero's route by day_open afterwards.
-//    Result: time-compatible mills naturally cluster on the same heroes.
-//
-// 2. Hero-route crossover (40%):
-//    For each hero slot i ≤ max_id, flip a coin to take the full route from
-//    parent 1 or parent 2.  Deduplicate globally (first occurrence wins).
-//    More disruptive — good for escaping local optima.
+// The resulting routes are re-evaluated with the correct hero's MP.
 
-fn day_crossover(p1: &Solution, p2: &Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
-    let max_id     = rng.gen_range(min(p1.max_id, p2.max_id)..=max(p1.max_id, p2.max_id));
-    let mut routes = empty_routes(max_id);
-    let mut seen   = HashSet::<u32>::new();
+fn crossover(p1: &Solution, p2: &Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
+    let use_day_aware = rng.gen_bool(0.6);
 
-    for day in 1..=MAX_DAY {
-        let donor = if rng.gen_bool(0.5) { p1 } else { p2 };
-        for hid in 1..=donor.max_id.min(max_id) {
-            if let Some(route) = donor.routes.get(&hid) {
-                for &mid in route {
-                    if d.mills[&mid].day_open == day && seen.insert(mid) {
-                        routes.get_mut(&hid).unwrap().push(mid);
+    if use_day_aware {
+        // Collect (hero_id, mill) pairs from chosen donor per day
+        let mut assignment: HashMap<u32, Vec<u32>> = HashMap::new(); // hero_id → mills
+        let mut seen = HashSet::<u32>::new();
+
+        for day in 1..=MAX_DAY {
+            let donor = if rng.gen_bool(0.5) { p1 } else { p2 };
+            for r in &donor.routes {
+                for &m in &r.mills {
+                    if d.mills[&m].day_open == day && seen.insert(m) {
+                        assignment.entry(r.hero_id).or_default().push(m);
                     }
                 }
             }
         }
-    }
-    // Sort each route chronologically so the simulation sees mills in time order
-    for r in routes.values_mut() { r.sort_by_key(|&m| d.mills[&m].day_open); }
-    make_solution(max_id, routes, d)
-}
 
-fn hero_crossover(p1: &Solution, p2: &Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
-    let max_id     = rng.gen_range(min(p1.max_id, p2.max_id)..=max(p1.max_id, p2.max_id));
-    let mut routes = empty_routes(max_id);
-    let mut seen   = HashSet::<u32>::new();
+        // Randomly drop or keep some heroes to vary count around sweet spot
+        let all_hids: Vec<u32> = assignment.keys().copied().collect();
+        let routes: Vec<Route> = all_hids.into_iter().filter_map(|hero_id| {
+            let mills = assignment.remove(&hero_id).unwrap();
+            if mills.is_empty() { return None; }
+            let mut sorted = mills;
+            sorted.sort_by_key(|&m| d.mills[&m].day_open);
+            let reward = simulate_hero(hero_id, &sorted, d);
+            Some(Route { hero_id, mills: sorted, reward })
+        }).collect();
 
-    for i in 1..=max_id {
-        let src = match (i <= p1.max_id, i <= p2.max_id) {
-            (true, true)  => if rng.gen_bool(0.5) { &p1.routes[&i] } else { &p2.routes[&i] },
-            (true, false) => &p1.routes[&i],
-            _             => &p2.routes[&i],
-        };
-        routes.insert(i, src.iter().copied().filter(|&m| seen.insert(m)).collect());
+        if routes.is_empty() {
+            // Fallback: clone a parent
+            return if rng.gen_bool(0.5) { p1.clone() } else { p2.clone() };
+        }
+        make_solution(routes)
+    } else {
+        // Hero-route crossover: for each hero slot take route from p1 or p2
+        let mut seen = HashSet::<u32>::new();
+        let n = p1.routes.len().max(p2.routes.len());
+        let mut routes: Vec<Route> = Vec::new();
+
+        for i in 0..n {
+            let src = match (i < p1.routes.len(), i < p2.routes.len()) {
+                (true,  true)  => if rng.gen_bool(0.5) { &p1.routes[i] } else { &p2.routes[i] },
+                (true,  false) => &p1.routes[i],
+                (false, true)  => &p2.routes[i],
+                _              => break,
+            };
+            let mills: Vec<u32> = src.mills.iter().copied().filter(|m| seen.insert(*m)).collect();
+            if mills.is_empty() { continue; }
+            let reward = simulate_hero(src.hero_id, &mills, d);
+            routes.push(Route { hero_id: src.hero_id, mills, reward });
+        }
+
+        if routes.is_empty() { return p1.clone(); }
+        make_solution(routes)
     }
-    make_solution(max_id, routes, d)
 }
 
 // ─── Mutation ─────────────────────────────────────────────────────────────────
 //
-// Five operators chosen uniformly:
-//
-// 0  swap      — swap two mills within one hero's route
-// 1  relocate  — move a mill to a different position (possibly different hero)
-// 2  add       — insert an unvisited mill in sorted day-order
-// 3  delete    — remove a random mill from a route
-// 4  resize    — hire or dismiss one hero
+// Six operators chosen uniformly:
+//   0  swap      — swap two mills within one route
+//   1  relocate  — move a mill to a different route (or same route, new pos)
+//   2  add       — insert an unvisited mill into a route
+//   3  delete    — remove a random mill from a route
+//   4  hire      — add a new route for an unused hero
+//   5  merge     — absorb shortest route into others via best-fit, drop hero
 
-fn mutate(mut sol: Solution, d: &ProblemData) -> Solution {
-    let mut rng = rand::thread_rng();
+fn mutate(mut sol: Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
+    let n = sol.routes.len();
+    if n == 0 { return sol; }
 
     match rng.gen_range(0u8..6) {
-        // ── 0: swap ──────────────────────────────────────────────────────
+        // ── 0: swap two mills within one route ───────────────────────────
         0 => {
-            let eligible: Vec<u32> =
-                (1..=sol.max_id).filter(|&h| sol.routes[&h].len() >= 2).collect();
-            if let Some(&h) = eligible.choose(&mut rng) {
-                let r = sol.routes.get_mut(&h).unwrap();
-                let n = r.len();
-                let i = rng.gen_range(0..n);
-                let mut j = rng.gen_range(0..n);
-                while j == i { j = rng.gen_range(0..n); }
-                r.swap(i, j);
-                refresh_hero(&mut sol, h, d);
+            let i = rng.gen_range(0..n);
+            if sol.routes[i].mills.len() >= 2 {
+                let len = sol.routes[i].mills.len();
+                let a = rng.gen_range(0..len);
+                let mut b = rng.gen_range(0..len);
+                while b == a { b = rng.gen_range(0..len); }
+                sol.routes[i].mills.swap(a, b);
+                refresh_route(&mut sol, i, d);
             }
         }
-        // ── 1: relocate ──────────────────────────────────────────────────
+        // ── 1: relocate a mill to another route ──────────────────────────
         1 => {
-            let positions: Vec<(u32, usize)> = sol.routes.iter()
-                .flat_map(|(&h, r)| (0..r.len()).map(move |i| (h, i)))
-                .collect();
-            if let Some(&(src, idx)) = positions.choose(&mut rng) {
-                let mill = sol.routes.get_mut(&src).unwrap().remove(idx);
-                let dst  = rng.gen_range(1..=sol.max_id);
-                let r    = sol.routes.get_mut(&dst).unwrap();
-                // Insert maintaining day-order
-                let pos = r.partition_point(|&m| d.mills[&m].day_open <= d.mills[&mill].day_open);
-                r.insert(pos, mill);
-                refresh_hero(&mut sol, src, d);
-                if dst != src { refresh_hero(&mut sol, dst, d); }
+            let src = rng.gen_range(0..n);
+            if !sol.routes[src].mills.is_empty() {
+                let idx = rng.gen_range(0..sol.routes[src].mills.len());
+                let mill = sol.routes[src].mills.remove(idx);
+                let dst  = rng.gen_range(0..n);
+                let pos  = sol.routes[dst].mills.partition_point(
+                    |&m| d.mills[&m].day_open <= d.mills[&mill].day_open
+                );
+                sol.routes[dst].mills.insert(pos, mill);
+                refresh_route(&mut sol, src, d);
+                if dst != src { refresh_route(&mut sol, dst, d); }
             }
         }
-        // ── 2: add unvisited mill ─────────────────────────────────────────
+        // ── 2: add an unvisited mill ──────────────────────────────────────
         2 => {
-            let visited: HashSet<u32> = sol.routes.values().flatten().copied().collect();
-            let avail: Vec<u32> =
-                d.mill_ids.iter().copied().filter(|k| !visited.contains(k)).collect();
-            if let Some(&mill) = avail.choose(&mut rng) {
-                let h = rng.gen_range(1..=sol.max_id);
-                let r = sol.routes.get_mut(&h).unwrap();
-                let p = r.partition_point(|&m| d.mills[&m].day_open <= d.mills[&mill].day_open);
-                r.insert(p, mill);
-                refresh_hero(&mut sol, h, d);
+            let visited = visited_set(&sol);
+            let avail: Vec<u32> = d.mill_ids.iter().copied()
+                .filter(|m| !visited.contains(m)).collect();
+            if let Some(&mill) = avail.choose(rng) {
+                let i   = rng.gen_range(0..n);
+                let pos = sol.routes[i].mills.partition_point(
+                    |&m| d.mills[&m].day_open <= d.mills[&mill].day_open
+                );
+                sol.routes[i].mills.insert(pos, mill);
+                refresh_route(&mut sol, i, d);
             }
         }
-        // ── 3: delete random mill ─────────────────────────────────────────
+        // ── 3: delete a random mill ───────────────────────────────────────
         3 => {
-            let positions: Vec<(u32, usize)> = sol.routes.iter()
-                .flat_map(|(&h, r)| (0..r.len()).map(move |i| (h, i)))
-                .collect();
-            if let Some(&(h, idx)) = positions.choose(&mut rng) {
-                sol.routes.get_mut(&h).unwrap().remove(idx);
-                refresh_hero(&mut sol, h, d);
+            let i = rng.gen_range(0..n);
+            if !sol.routes[i].mills.is_empty() {
+                let idx = rng.gen_range(0..sol.routes[i].mills.len());
+                sol.routes[i].mills.remove(idx);
+                refresh_route(&mut sol, i, d);
             }
         }
-        // ── 4: hire / dismiss hero ────────────────────────────────────────
+        // ── 4: hire a new hero (unused, high-MP preferred) ───────────────
         4 => {
-            if rng.gen_bool(0.5) && sol.max_id < MAX_HEROES {
-                sol.max_id += 1;
-                let new_id = sol.max_id; // copy before any borrow of sol
-                sol.routes.insert(new_id, Vec::new());
-                refresh_hero(&mut sol, new_id, d);
-                // Adjust fitness for the new hire cost
-                if let Some(f) = sol.fitness.as_mut() { *f -= HERO_COST as i64; }
-            } else if sol.max_id > 1 {
-                // Dismiss highest-id hero; redistribute mills via best-fit
-                // (simulate_hero for each candidate insertion — much smarter
-                //  than random, reduces accidental mill losses).
-                let old = sol.max_id;
-                let orphans = sol.routes.remove(&old).unwrap_or_default();
-                sol.hero_rewards.remove(&old);
-                sol.max_id -= 1;
-                for mill in orphans {
-                    let mut best_gain: i64 = i64::MIN;
-                    let mut best_dst = 1u32;
-                    let mut best_pos = 0usize;
-                    for dst in 1..=sol.max_id {
-                        let old_rew = sol.hero_rewards.get(&dst).copied().unwrap_or(0);
-                        let route   = &sol.routes[&dst];
-                        // Only check day-compatible positions to keep it fast
-                        let lo = route.partition_point(|&m|
-                            d.mills[&m].day_open < d.mills[&mill].day_open.saturating_sub(1));
-                        let hi = (route.partition_point(|&m|
-                            d.mills[&m].day_open <= d.mills[&mill].day_open + 1)).min(route.len());
-                        for pos in lo..=hi {
-                            let mut nr = route.clone();
-                            nr.insert(pos, mill);
-                            let new_rew = simulate_hero(dst, &nr, d);
-                            let gain    = new_rew as i64 - old_rew as i64;
-                            if gain > best_gain {
-                                best_gain = gain;
-                                best_dst  = dst;
-                                best_pos  = pos;
-                            }
-                        }
-                    }
-                    sol.routes.get_mut(&best_dst).unwrap().insert(best_pos, mill);
-                    refresh_hero(&mut sol, best_dst, d);
-                }
-                // Adjust fitness for removed hero cost
-                if let Some(f) = sol.fitness.as_mut() { *f += HERO_COST as i64; }
+            let used = used_heroes(&sol);
+            let avail: Vec<u32> = d.hero_ids_by_mp.iter().copied()
+                .filter(|h| !used.contains(h)).collect();
+            if let Some(&hero_id) = avail.first() {
+                sol.routes.push(Route { hero_id, mills: Vec::new(), reward: 0 });
+                sol.fitness -= HERO_COST as i64;
             }
         }
-        // ── 5: merge-smallest — absorb thinnest route into others ────────
-        // This is the primary operator for reducing hero count.
-        // Finds the hero with the fewest mills, tries every (dst, pos) for
-        // each orphaned mill using simulate_hero, accepts only if net fitness
-        // improves (saving 2500 hire cost usually more than compensates for
-        // any small route degradation).
+        // ── 5: merge smallest route into others, drop hero ────────────────
         _ => {
-            if sol.max_id <= 1 { return sol; }
-            // Find thinnest hero (fewest mills in route)
-            let thin = (1..=sol.max_id)
-                .min_by_key(|&h| sol.routes.get(&h).map_or(usize::MAX, |r| r.len()))
-                .unwrap();
-            let thin_len = sol.routes.get(&thin).map_or(0, |r| r.len());
-            // Only attempt merge if route is short enough to be worth trying
-            if thin_len > 12 { return sol; }
+            if n <= 1 { return sol; }
+            // Find route with fewest mills
+            let thin_idx = sol.routes.iter().enumerate()
+                .min_by_key(|(_, r)| r.mills.len()).map(|(i, _)| i).unwrap();
+            if sol.routes[thin_idx].mills.len() > 8 { return sol; }
 
-            let orphans   = sol.routes[&thin].clone();
-            let old_fit   = sol.fitness.unwrap_or(i64::MIN);
+            let orphans = sol.routes[thin_idx].mills.clone();
+            let old_fit = sol.fitness;
+
+            // Try merging via best-fit insertion
             let mut trial = sol.clone();
-            trial.routes.get_mut(&thin).unwrap().clear();
-            *trial.hero_rewards.get_mut(&thin).unwrap() = 0;
-            if let Some(f) = trial.fitness.as_mut() {
-                *f -= sol.hero_rewards.get(&thin).copied().unwrap_or(0) as i64;
-            }
+            // Remove and adjust fitness
+            let old_rew = trial.routes[thin_idx].reward as i64;
+            trial.fitness -= old_rew + HERO_COST as i64; // lose reward, save hire cost
+            trial.routes.swap_remove(thin_idx);          // O(1), no renumbering
 
-            for &mill in &orphans {
-                let mut best_gain: i64 = i64::MIN;
-                let mut best_dst = 0u32;
-                let mut best_pos = 0usize;
-                for dst in 1..=trial.max_id {
-                    if dst == thin { continue; }
-                    let old_rew = trial.hero_rewards.get(&dst).copied().unwrap_or(0);
-                    let route   = &trial.routes[&dst];
-                    // Narrow insertion window to day-compatible positions
-                    let lo = route.partition_point(|&m|
-                        d.mills[&m].day_open < d.mills[&mill].day_open.saturating_sub(1));
-                    let hi = (route.partition_point(|&m|
-                        d.mills[&m].day_open <= d.mills[&mill].day_open + 1)).min(route.len());
+            for mill in &orphans {
+                let mut best_gain = i64::MIN;
+                let mut best_ri   = 0usize;
+                let mut best_pos  = 0usize;
+                for ri in 0..trial.routes.len() {
+                    let old_rew = trial.routes[ri].reward;
+                    let lo = trial.routes[ri].mills.partition_point(|&m|
+                        d.mills[&m].day_open < d.mills[mill].day_open.saturating_sub(1));
+                    let hi = (trial.routes[ri].mills.partition_point(|&m|
+                        d.mills[&m].day_open <= d.mills[mill].day_open + 1))
+                        .min(trial.routes[ri].mills.len());
                     for pos in lo..=hi {
-                        let mut nr  = route.clone();
-                        nr.insert(pos, mill);
-                        let new_rew = simulate_hero(dst, &nr, d);
+                        let mut nr = trial.routes[ri].mills.clone();
+                        nr.insert(pos, *mill);
+                        let new_rew = simulate_hero(trial.routes[ri].hero_id, &nr, d);
                         let gain    = new_rew as i64 - old_rew as i64;
                         if gain > best_gain {
-                            best_gain = gain;
-                            best_dst  = dst;
-                            best_pos  = pos;
+                            best_gain = gain; best_ri = ri; best_pos = pos;
                         }
                     }
                 }
-                if best_dst > 0 {
-                    trial.routes.get_mut(&best_dst).unwrap().insert(best_pos, mill);
-                    refresh_hero(&mut trial, best_dst, d);
-                }
+                trial.routes[best_ri].mills.insert(best_pos, *mill);
+                refresh_route(&mut trial, best_ri, d);
             }
 
-            // Renumber: close the gap left by removing `thin`
-            for h in thin..trial.max_id {
-                let route  = trial.routes.remove(&(h + 1)).unwrap_or_default();
-                let reward = trial.hero_rewards.remove(&(h + 1)).unwrap_or(0);
-                trial.routes.insert(h, route);
-                trial.hero_rewards.insert(h, reward);
-            }
-            trial.max_id -= 1;
-            recompute(&mut trial, d);
-
-            // Accept if net fitness improves: saving 2500 hero cost usually
-            // compensates for any slight coverage reduction.
-            if trial.fitness.unwrap_or(i64::MIN) > old_fit {
-                return trial;
-            }
+            if trial.fitness > old_fit { return trial; }
         }
     }
     sol
@@ -623,70 +642,54 @@ fn mutate(mut sol: Solution, d: &ProblemData) -> Solution {
 
 // ─── Or-opt local search ─────────────────────────────────────────────────────
 //
-// Or-opt moves segments of 1, 2, or 3 consecutive mills to a better position,
-// both within the same hero's route (intra) and across heroes (inter).
+// Three phases per iteration:
+//   A. Intra-route: move a segment of 1–3 mills within the same route.
+//   B. Inter-route: move a segment from one route to another.
+//   C. Inter-route swap: exchange single mills between two routes.
 //
-// Using the per-hero reward cache means each accepted move updates fitness with
-// two simulate_hero calls instead of a full-solution recompute.
-//
-// Three phases each iteration:
-//   A. Intra-route Or-opt   (segments within one hero)
-//   B. Inter-route Or-opt   (move a segment from hero h1 to hero h2)
-//   C. Inter-route swap     (exchange one mill between two heroes)
+// Heroes with late-day mills are scanned first (most constrained → most gain).
 
 fn or_opt(mut sol: Solution, max_iter: u32, d: &ProblemData) -> Solution {
-    if sol.fitness.is_none() { recompute(&mut sol, d); }
-
-    // ── Late-mill priority: sort hero scan order so heroes carrying day-5/6/7
-    //    mills come first.  Those routes have the tightest time windows and
-    //    benefit most from positional improvements.
-    let hero_order: Vec<u32> = {
-        let mut order: Vec<u32> = (1..=sol.max_id).collect();
-        order.sort_by_key(|&h| {
-            // Primary key: max day_open in route (descending → Reverse)
-            let max_day = sol.routes.get(&h)
-                .and_then(|r| r.iter().map(|&m| d.mills[&m].day_open).max())
-                .unwrap_or(0);
-            Reverse(max_day)
+    // Build scan order: routes with highest max(day_open) first
+    let priority_order = |sol: &Solution| -> Vec<usize> {
+        let mut order: Vec<usize> = (0..sol.routes.len()).collect();
+        order.sort_by_key(|&i| {
+            let max_day = sol.routes[i].mills.iter()
+                .map(|&m| d.mills[&m].day_open).max().unwrap_or(0);
+            std::cmp::Reverse(max_day)
         });
         order
     };
 
     for _ in 0..max_iter {
         let mut improved = false;
+        let order = priority_order(&sol);
 
-        // ── A: Intra-route Or-opt (late-mill heroes first) ────────────────
-        'intra: for &h in &hero_order {
-            let n = sol.routes.get(&h).map_or(0, |r| r.len());
+        // ── A: Intra-route Or-opt ────────────────────────────────────────
+        'intra: for &ri in &order {
+            let n = sol.routes[ri].mills.len();
             if n < 2 { continue; }
 
-            // Within the route, try late-day segments before early-day ones.
-            // Build a scan order for segment start indices sorted by the
-            // day_open of the first mill in that segment (descending).
-            let mut seg_starts: Vec<usize> = (0..n).collect();
-            seg_starts.sort_by_key(|&i| {
-                Reverse(d.mills[&sol.routes[&h][i]].day_open)
-            });
+            // Seg-start priority: late-day segments first
+            let mut starts: Vec<usize> = (0..n).collect();
+            starts.sort_by_key(|&i| std::cmp::Reverse(d.mills[&sol.routes[ri].mills[i]].day_open));
 
             for seg in 1..=3usize {
                 if seg >= n { continue; }
-                for &i in &seg_starts {
+                for &i in &starts {
                     if i + seg > n { continue; }
                     for j in 0..=(n - seg) {
                         if j >= i.saturating_sub(1) && j <= i + seg { continue; }
-
-                        let old = sol.routes[&h].clone();
-                        let mut new_r = old.clone();
-                        let chunk: Vec<u32> = new_r.drain(i..i + seg).collect();
-                        let ins = if j > i { (j - seg).min(new_r.len()) } else { j };
-                        for (k, &m) in chunk.iter().enumerate() { new_r.insert(ins + k, m); }
-
-                        let old_rew = sol.hero_rewards[&h];
-                        let new_rew = simulate_hero(h, &new_r, d);
+                        let mut new_mills = sol.routes[ri].mills.clone();
+                        let chunk: Vec<u32> = new_mills.drain(i..i+seg).collect();
+                        let ins = if j > i { (j - seg).min(new_mills.len()) } else { j };
+                        for (k, &m) in chunk.iter().enumerate() { new_mills.insert(ins+k, m); }
+                        let old_rew = sol.routes[ri].reward;
+                        let new_rew = simulate_hero(sol.routes[ri].hero_id, &new_mills, d);
                         if new_rew > old_rew {
-                            sol.routes.insert(h, new_r);
-                            *sol.hero_rewards.get_mut(&h).unwrap()  = new_rew;
-                            *sol.fitness.as_mut().unwrap() += new_rew as i64 - old_rew as i64;
+                            sol.routes[ri].mills  = new_mills;
+                            sol.fitness          += new_rew as i64 - old_rew as i64;
+                            sol.routes[ri].reward = new_rew;
                             improved = true;
                             break 'intra;
                         }
@@ -695,45 +698,38 @@ fn or_opt(mut sol: Solution, max_iter: u32, d: &ProblemData) -> Solution {
             }
         }
 
-        // ── B: Inter-route Or-opt (late-mill heroes as source first) ──────
-        'inter: for &h1 in &hero_order {
-            for &h2 in &hero_order {
-                if h1 == h2 { continue; }
-                let n1 = sol.routes.get(&h1).map_or(0, |r| r.len());
-                let n2 = sol.routes.get(&h2).map_or(0, |r| r.len());
-                if n1 == 0 { continue; }
+        // ── B: Inter-route Or-opt ────────────────────────────────────────
+        'inter: for &r1 in &order {
+            let n1 = sol.routes[r1].mills.len();
+            if n1 == 0 { continue; }
+            let mut starts: Vec<usize> = (0..n1).collect();
+            starts.sort_by_key(|&i| std::cmp::Reverse(d.mills[&sol.routes[r1].mills[i]].day_open));
 
-                // Prioritise moving late-day segments out of h1
-                let mut seg_starts: Vec<usize> = (0..n1).collect();
-                seg_starts.sort_by_key(|&i| {
-                    Reverse(d.mills[&sol.routes[&h1][i]].day_open)
-                });
+            for r2 in 0..sol.routes.len() {
+                if r2 == r1 { continue; }
+                let n2 = sol.routes[r2].mills.len();
 
                 for seg in 1..=3usize {
                     if seg > n1 { continue; }
-                    for &i in &seg_starts {
+                    for &i in &starts {
                         if i + seg > n1 { continue; }
                         for ins in 0..=n2 {
-                            let old1 = sol.routes[&h1].clone();
-                            let old2 = sol.routes[&h2].clone();
+                            let mut new1 = sol.routes[r1].mills.clone();
+                            let chunk: Vec<u32> = new1.drain(i..i+seg).collect();
+                            let mut new2 = sol.routes[r2].mills.clone();
+                            for (k, &m) in chunk.iter().enumerate() { new2.insert(ins+k, m); }
 
-                            let mut new1 = old1.clone();
-                            let chunk: Vec<u32> = new1.drain(i..i + seg).collect();
-                            let mut new2 = old2.clone();
-                            for (k, &m) in chunk.iter().enumerate() { new2.insert(ins + k, m); }
-
-                            let or1 = sol.hero_rewards[&h1];
-                            let or2 = sol.hero_rewards[&h2];
-                            let nr1 = simulate_hero(h1, &new1, d);
-                            let nr2 = simulate_hero(h2, &new2, d);
+                            let or1 = sol.routes[r1].reward;
+                            let or2 = sol.routes[r2].reward;
+                            let nr1 = simulate_hero(sol.routes[r1].hero_id, &new1, d);
+                            let nr2 = simulate_hero(sol.routes[r2].hero_id, &new2, d);
 
                             if nr1 + nr2 > or1 + or2 {
-                                sol.routes.insert(h1, new1);
-                                sol.routes.insert(h2, new2);
-                                *sol.hero_rewards.get_mut(&h1).unwrap() = nr1;
-                                *sol.hero_rewards.get_mut(&h2).unwrap() = nr2;
-                                *sol.fitness.as_mut().unwrap() +=
-                                    (nr1 + nr2) as i64 - (or1 + or2) as i64;
+                                sol.routes[r1].mills  = new1;
+                                sol.routes[r2].mills  = new2;
+                                sol.fitness          += (nr1+nr2) as i64 - (or1+or2) as i64;
+                                sol.routes[r1].reward = nr1;
+                                sol.routes[r2].reward = nr2;
                                 improved = true;
                                 break 'inter;
                             }
@@ -743,32 +739,28 @@ fn or_opt(mut sol: Solution, max_iter: u32, d: &ProblemData) -> Solution {
             }
         }
 
-        // ── C: Inter-route swap (late-mill heroes first) ──────────────────
-        'swap: for &h1 in &hero_order {
-            for &h2 in &hero_order {
-                if h2 <= h1 { continue; } // avoid duplicate pairs
-                let n1 = sol.routes.get(&h1).map_or(0, |r| r.len());
-                let n2 = sol.routes.get(&h2).map_or(0, |r| r.len());
-                if n1 == 0 || n2 == 0 { continue; }
-
+        // ── C: Inter-route swap ──────────────────────────────────────────
+        'swap: for &r1 in &order {
+            let n1 = sol.routes[r1].mills.len();
+            if n1 == 0 { continue; }
+            for r2 in (r1+1)..sol.routes.len() {
+                let n2 = sol.routes[r2].mills.len();
+                if n2 == 0 { continue; }
                 for i in 0..n1 {
                     for j in 0..n2 {
-                        let mut new1 = sol.routes[&h1].clone();
-                        let mut new2 = sol.routes[&h2].clone();
+                        let mut new1 = sol.routes[r1].mills.clone();
+                        let mut new2 = sol.routes[r2].mills.clone();
                         std::mem::swap(&mut new1[i], &mut new2[j]);
-
-                        let or1 = sol.hero_rewards[&h1];
-                        let or2 = sol.hero_rewards[&h2];
-                        let nr1 = simulate_hero(h1, &new1, d);
-                        let nr2 = simulate_hero(h2, &new2, d);
-
+                        let or1 = sol.routes[r1].reward;
+                        let or2 = sol.routes[r2].reward;
+                        let nr1 = simulate_hero(sol.routes[r1].hero_id, &new1, d);
+                        let nr2 = simulate_hero(sol.routes[r2].hero_id, &new2, d);
                         if nr1 + nr2 > or1 + or2 {
-                            sol.routes.insert(h1, new1);
-                            sol.routes.insert(h2, new2);
-                            *sol.hero_rewards.get_mut(&h1).unwrap() = nr1;
-                            *sol.hero_rewards.get_mut(&h2).unwrap() = nr2;
-                            *sol.fitness.as_mut().unwrap() +=
-                                (nr1 + nr2) as i64 - (or1 + or2) as i64;
+                            sol.routes[r1].mills  = new1;
+                            sol.routes[r2].mills  = new2;
+                            sol.fitness          += (nr1+nr2) as i64 - (or1+or2) as i64;
+                            sol.routes[r1].reward = nr1;
+                            sol.routes[r2].reward = nr2;
                             improved = true;
                             break 'swap;
                         }
@@ -782,247 +774,177 @@ fn or_opt(mut sol: Solution, max_iter: u32, d: &ProblemData) -> Solution {
     sol
 }
 
-// ─── Day-order repair ────────────────────────────────────────────────────────
-//
-// After crossover and mutation routes can be out of time order.
-// Sorting by day_open is a cheap, always-safe repair that never hurts fitness
-// (the simulation itself is order-dependent, so sorted = more reward).
-
-fn repair_order(mut sol: Solution, d: &ProblemData) -> Solution {
-    let mut changed = false;
-    for r in sol.routes.values_mut() {
-        if r.windows(2).any(|w| d.mills[&w[0]].day_open > d.mills[&w[1]].day_open) {
-            r.sort_by_key(|&m| d.mills[&m].day_open);
-            changed = true;
-        }
-    }
-    if changed { recompute(&mut sol, d); }
-    sol
-}
-
-
-// ─── Double-bridge perturbation ──────────────────────────────────────────────
-//
-// Cuts one hero's route into 4 segments and reconnects them in a new order
-// (seg0 + seg2 + seg1 + seg3).  This is the classic "Lin-Kernighan" escape
-// move: it cannot be undone by any sequence of 2-opt moves, so it genuinely
-// breaks out of local-optima basins.
-//
-// Applied per-hero independently when stagnation is high.
+// ─── Double-bridge perturbation ───────────────────────────────────────────────
 
 fn double_bridge(mut sol: Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
-    let heroes: Vec<u32> = (1..=sol.max_id)
-        .filter(|&h| sol.routes.get(&h).map_or(false, |r| r.len() >= 8))
-        .collect();
-
-    if heroes.is_empty() { return sol; }
-
-    for &h in &heroes {
-        let n = sol.routes[&h].len();
-        // Draw 3 unique cut-points in 1..n-1 and sort them → a < b < c
+    for i in 0..sol.routes.len() {
+        let n = sol.routes[i].mills.len();
+        if n < 8 { continue; }
         let mut cuts: Vec<usize> = (1..n).collect();
         cuts.partial_shuffle(rng, 3);
         let mut c = [cuts[0], cuts[1], cuts[2]];
         c.sort_unstable();
         let (a, b, cc) = (c[0], c[1], c[2]);
-
-        let route = sol.routes[&h].clone();
-        // Classic double-bridge reconnection order: seg0 + seg2 + seg1 + seg3
-        let new_route: Vec<u32> = route[..a].iter()
+        let route = sol.routes[i].mills.clone();
+        let new_mills: Vec<u32> = route[..a].iter()
             .chain(&route[b..cc])
             .chain(&route[a..b])
             .chain(&route[cc..])
-            .copied()
-            .collect();
-
-        sol.routes.insert(h, new_route);
-        refresh_hero(&mut sol, h, d);
+            .copied().collect();
+        sol.routes[i].mills = new_mills;
+        refresh_route(&mut sol, i, d);
     }
     sol
 }
 
-// ─── Insert-missing-mills pass ────────────────────────────────────────────────
-//
-// Scans every mill not yet in any route.  For each missing mill, tries every
-// (hero, position) insertion and keeps the one with the largest reward gain.
-// Only inserts if the gain is strictly positive (i.e. the mill actually pays
-// off given travel cost and time window).
-//
-// Parallelised: each missing mill's best insertion is found independently by a
-// rayon worker; the results are then applied sequentially in day-open order so
-// earlier insertions don't invalidate later ones (route lengths stay consistent).
+// ─── Insert missing mills ─────────────────────────────────────────────────────
 
-fn insert_missing_mills(
-    mut sol: Solution,
-    d: &ProblemData,
-    pb: &ProgressBar,
-) -> Solution {
-    if sol.fitness.is_none() { recompute(&mut sol, d); }
-
-    let visited: HashSet<u32> = sol.routes.values().flatten().copied().collect();
-    let mut missing: Vec<u32> = d.mill_ids.iter()
-        .copied()
-        .filter(|m| !visited.contains(m))
-        .collect();
-
-    // Prioritise earlier-opening mills — they have tighter time constraints and
-    // constrain routing options most; inserting them first leaves the widest
-    // flexibility for later-day mills.
+fn insert_missing_mills(mut sol: Solution, d: &ProblemData, pb: &ProgressBar) -> Solution {
+    let visited = visited_set(&sol);
+    let mut missing: Vec<u32> = d.mill_ids.iter().copied()
+        .filter(|m| !visited.contains(m)).collect();
     missing.sort_by_key(|&m| d.mills[&m].day_open);
 
     pb.set_length(missing.len() as u64);
-    pb.set_message(format!("insert_missing  {} mills to try", missing.len()));
+    pb.set_message(format!("insert-missing  {} mills", missing.len()));
     pb.reset();
 
-    // For each missing mill: find (hero, pos, gain) in parallel.
-    // We snapshot routes & rewards before the loop so parallel workers all
-    // read the same consistent state.  Insertions are then applied one-by-one
-    // on the main thread so the cache stays coherent.
-    let snapshot_routes:  Vec<(u32, Vec<u32>)> = sol.routes.iter()
-        .map(|(&h, r)| (h, r.clone()))
-        .collect();
-    let snapshot_rewards: HashMap<u32, u32>    = sol.hero_rewards.clone();
+    // Snapshot for parallel candidate search
+    let snap: Vec<(u32, Vec<u32>, u32)> = sol.routes.iter()
+        .map(|r| (r.hero_id, r.mills.clone(), r.reward)).collect();
 
-    // For each missing mill find the best (hero_id, insert_position, gain)
-    let candidates: Vec<Option<(u32, usize, u32)>> = missing
-        .par_iter()
-        .map(|&mill_id| {
-            let mut best_gain: u32  = 0;
-            let mut best_hero: u32  = 0;
-            let mut best_pos: usize = 0;
-
-            for &(hid, ref route) in &snapshot_routes {
-                if hid > sol.max_id { continue; }
-                let old_rew = *snapshot_rewards.get(&hid).unwrap_or(&0);
-
-                for pos in 0..=route.len() {
-                    let mut trial = route.clone();
-                    trial.insert(pos, mill_id);
-                    let new_rew = simulate_hero(hid, &trial, d);
-                    if new_rew > old_rew + best_gain {
-                        best_gain = new_rew - old_rew;
-                        best_hero = hid;
-                        best_pos  = pos;
-                    }
+    let candidates: Vec<Option<(usize, usize)>> = missing.par_iter()
+        .map(|&mill| {
+            let mut best_gain = 0i64;
+            let mut best_ri   = None;
+            let mut best_pos  = 0usize;
+            for (ri, (hero_id, mills, old_rew)) in snap.iter().enumerate() {
+                for pos in 0..=mills.len() {
+                    let mut nr = mills.clone();
+                    nr.insert(pos, mill);
+                    let new_rew = simulate_hero(*hero_id, &nr, d);
+                    let gain    = new_rew as i64 - *old_rew as i64;
+                    if gain > best_gain { best_gain = gain; best_ri = Some(ri); best_pos = pos; }
                 }
             }
-
             pb.inc(1);
-            if best_hero > 0 { Some((best_hero, best_pos, best_gain)) } else { None }
+            best_ri.map(|ri| (ri, best_pos))
         })
         .collect();
 
-    // Apply insertions sequentially (route lengths shift after each insert,
-    // so positions from the parallel scan are stale — recompute via partition_point).
-    for (mill_id, maybe) in missing.iter().zip(candidates.iter()) {
-        if let Some(&(hero, _pos, _gain)) = maybe.as_ref() {
-            // Read pos first (immutable borrow), then drop before mut borrow.
+    let mut inserted = 0usize;
+    for (mill, maybe) in missing.iter().zip(candidates.iter()) {
+        if let Some(&(ri, _)) = maybe.as_ref() {
             let pos = {
-                let route = sol.routes.get(&hero).unwrap();
-                route.partition_point(|&m| {
-                    d.mills[&m].day_open <= d.mills[mill_id].day_open
-                })
-            }; // immutable borrow ends here
-            sol.routes.get_mut(&hero).unwrap().insert(pos, *mill_id);
-            refresh_hero(&mut sol, hero, d);
+                let r = &sol.routes[ri];
+                r.mills.partition_point(|&m| d.mills[&m].day_open <= d.mills[mill].day_open)
+            };
+            sol.routes[ri].mills.insert(pos, *mill);
+            refresh_route(&mut sol, ri, d);
+            inserted += 1;
         }
     }
-
-    pb.finish_with_message(format!(
-        "✓ insert_missing  inserted {}/{}",
-        candidates.iter().filter(|c| c.is_some()).count(),
-        missing.len()
-    ));
+    pb.finish_with_message(format!("✓ insert-missing  inserted {inserted}/{}",  missing.len()));
     sol
 }
 
-
-// ─── Trim unprofitable heroes ────────────────────────────────────────────────
+// ─── Trim unprofitable heroes ─────────────────────────────────────────────────
 //
-// A hero whose total collected reward is less than their hire cost (HERO_COST)
-// is a net drag on fitness.  We remove the worst-offending hero, redistribute
-// their mills to the remaining heroes (inserting in day-open order to preserve
-// temporal feasibility), and recompute fitness.  Repeat until all remaining
-// heroes are profitable or only one hero is left.
-//
-// "Redistribute" uses the same day-aware insert used by mutation: mills are
-// placed at the partition_point that keeps each route sorted by day_open.
-// A small random jitter is applied to the destination hero so the same hero
-// doesn't absorb all orphaned mills.
+// Removes routes earning less than HERO_COST, redistributing their mills via
+// best-fit insertion.  Uses swap_remove (O(1)) — no renumbering, no MP confusion.
 
-fn trim_unprofitable_heroes(mut sol: Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
+fn trim_unprofitable(mut sol: Solution, d: &ProblemData, rng: &mut impl Rng) -> Solution {
     loop {
-        if sol.max_id <= 1 { break; }
+        if sol.routes.len() <= 1 { break; }
+        let worst_idx = match sol.routes.iter().enumerate()
+            .filter(|(_, r)| (r.reward as i64) < HERO_COST as i64)
+            .min_by_key(|(_, r)| r.reward)
+            .map(|(i, _)| i)
+        {
+            Some(i) => i,
+            None    => break,
+        };
 
-        // Find the hero with the lowest reward-to-cost ratio
-        let worst = (1..=sol.max_id).min_by_key(|&h| {
-            sol.hero_rewards.get(&h).copied().unwrap_or(0)
-        });
+        let orphans = sol.routes[worst_idx].mills.clone();
+        let old_rew = sol.routes[worst_idx].reward as i64;
+        sol.fitness -= old_rew + HERO_COST as i64; // remove reward, recover hire cost
+        sol.routes.swap_remove(worst_idx);
 
-        let worst_hid = match worst { Some(h) => h, None => break };
-        let worst_rew = sol.hero_rewards.get(&worst_hid).copied().unwrap_or(0);
-
-        // Only remove if the hero genuinely costs more than they earn
-        if worst_rew as i64 >= HERO_COST as i64 { break; }
-
-        // Remove hero and collect their mills
-        let orphans = sol.routes.remove(&worst_hid).unwrap_or_default();
-        sol.hero_rewards.remove(&worst_hid);
-
-        // Renumber: shift all heroes above worst_hid down by one so the
-        // id space stays contiguous (required by the rest of the algorithm).
-        for h in worst_hid..sol.max_id {
-            let route   = sol.routes.remove(&(h + 1)).unwrap_or_default();
-            let reward  = sol.hero_rewards.remove(&(h + 1)).unwrap_or(0);
-            sol.routes.insert(h, route);
-            sol.hero_rewards.insert(h, reward);
-        }
-        sol.max_id -= 1;
-
-        // Redistribute orphaned mills to random remaining heroes in day order
         for mill in orphans {
-            let dst   = rng.gen_range(1..=sol.max_id);
-            let route = sol.routes.get_mut(&dst).unwrap();
-            let pos   = route.partition_point(|&m| {
-                d.mills[&m].day_open <= d.mills[&mill].day_open
-            });
-            route.insert(pos, mill);
+            let dst = rng.gen_range(0..sol.routes.len());
+            let pos = sol.routes[dst].mills.partition_point(
+                |&m| d.mills[&m].day_open <= d.mills[&mill].day_open
+            );
+            sol.routes[dst].mills.insert(pos, mill);
+            refresh_route(&mut sol, dst, d);
         }
-
-        // Full recompute because multiple routes changed
-        recompute(&mut sol, d);
     }
     sol
+}
+
+// ─── Aggressive merge ─────────────────────────────────────────────────────────
+//
+// Tries to merge the thinnest route into others using best-fit insertion.
+// Accepts only if net fitness strictly improves (saves HERO_COST, must offset any loss).
+
+fn aggressive_merge(mut sol: Solution, d: &ProblemData) -> Solution {
+    if sol.routes.len() <= 1 { return sol; }
+
+    let thin_idx = sol.routes.iter().enumerate()
+        .min_by_key(|(_, r)| r.mills.len()).map(|(i, _)| i).unwrap();
+
+    let old_fit  = sol.fitness;
+    let orphans  = sol.routes[thin_idx].mills.clone();
+    let old_rew  = sol.routes[thin_idx].reward as i64;
+
+    // Tentatively remove
+    sol.fitness -= old_rew + HERO_COST as i64;
+    sol.routes.swap_remove(thin_idx);
+
+    for mill in &orphans {
+        let mut best_gain = i64::MIN;
+        let mut best_ri   = 0usize;
+        let mut best_pos  = 0usize;
+        for ri in 0..sol.routes.len() {
+            let or = sol.routes[ri].reward;
+            for pos in 0..=sol.routes[ri].mills.len() {
+                let mut nr = sol.routes[ri].mills.clone();
+                nr.insert(pos, *mill);
+                let nr_rew = simulate_hero(sol.routes[ri].hero_id, &nr, d);
+                let gain   = nr_rew as i64 - or as i64;
+                if gain > best_gain { best_gain = gain; best_ri = ri; best_pos = pos; }
+            }
+        }
+        sol.routes[best_ri].mills.insert(best_pos, *mill);
+        refresh_route(&mut sol, best_ri, d);
+    }
+
+    if sol.fitness > old_fit { sol } else {
+        // Undo: rebuild original (recompute is cheaper than reversing swap_remove)
+        // Caller keeps original on rejection
+        sol.fitness = old_fit; // signal rejection; caller will discard
+        sol
+    }
 }
 
 // ─── Population restart ───────────────────────────────────────────────────────
-//
-// When the GA has stagnated for `threshold` generations, the bottom half of the
-// population is replaced with fresh greedy individuals.  The top half (elites)
-// is kept so all accumulated learning is preserved.  After restart, stagnation
-// counter is reset and the new individuals go through or-opt before joining the
-// next generation.
 
-fn restart_population(
-    mut pop: Vec<Solution>,
-    d: &ProblemData,
-    ls_iter: u32,
-    pb: &ProgressBar,
-) -> Vec<Solution> {
+fn restart_population(mut pop: Vec<Solution>, d: &ProblemData, ls_iter: u32, pb: &ProgressBar) -> Vec<Solution> {
     let keep = pop.len() / 2;
-    pop.sort_by_key(|s| Reverse(s.fitness.unwrap_or(i64::MIN)));
+    pop.sort_by_key(|s| std::cmp::Reverse(s.fitness));
     pop.truncate(keep);
 
-    let fresh_count = pop.len(); // refill back to original size
+    let fresh_n = pop.len();
     pb.reset();
-    pb.set_length(fresh_count as u64);
-    pb.set_message(format!("Population restart — generating {} new individuals", fresh_count));
+    pb.set_length(fresh_n as u64);
+    pb.set_message(format!("restart — generating {fresh_n} new individuals"));
 
-    let fresh: Vec<Solution> = (0..fresh_count)
+    let fresh: Vec<Solution> = (0..fresh_n)
         .into_par_iter()
         .map(|_| {
             let mut rng = rand::thread_rng();
-            let sol = greedy_solution(d, &mut rng);
+            let n   = rng.gen_range(20usize..=24);
+            let sol = greedy_solution(n, d, &mut rng);
             let sol = or_opt(sol, ls_iter, d);
             pb.inc(1);
             sol
@@ -1030,205 +952,97 @@ fn restart_population(
         .collect();
 
     pop.extend(fresh);
-    pb.finish_with_message(format!("✓ Restart complete — pop size {}", pop.len()));
+    pb.finish_with_message(format!("✓ restart — pop {}", pop.len()));
     pop
-}
-
-
-// ─── Aggressive merge ────────────────────────────────────────────────────────
-//
-// Applied to the top `elite_count` individuals when stagnation fires.
-// Unlike trim_unprofitable_heroes (which only removes heroes earning < HERO_COST),
-// aggressive_merge tries to merge the thinnest route even when it would cause a
-// small fitness loss — because reducing hero count by 1 saves exactly 2500, so
-// losing up to 4 mills (4×500=2000) is still a net positive.
-//
-// The 500-point tolerance means we accept the merge if we lose fewer than 5 mills.
-// Parallelised at the call site (applied per-individual via par_iter).
-
-fn aggressive_merge(mut sol: Solution, d: &ProblemData) -> Solution {
-    if sol.max_id <= 1 { return sol; }
-
-    // Find thinnest hero
-    let thin = match (1..=sol.max_id)
-        .min_by_key(|&h| sol.routes.get(&h).map_or(usize::MAX, |r| r.len()))
-    {
-        Some(h) => h,
-        None    => return sol,
-    };
-
-    let old_fit = sol.fitness.unwrap_or(i64::MIN);
-    let orphans = sol.routes[&thin].clone();
-    let mut trial = sol.clone();
-    trial.routes.get_mut(&thin).unwrap().clear();
-    *trial.hero_rewards.get_mut(&thin).unwrap() = 0;
-    if let Some(f) = trial.fitness.as_mut() {
-        *f -= sol.hero_rewards.get(&thin).copied().unwrap_or(0) as i64;
-    }
-
-    // Best-fit insertion for each orphan
-    for &mill in &orphans {
-        let mut best_gain: i64 = i64::MIN;
-        let mut best_dst = 0u32;
-        let mut best_pos = 0usize;
-
-        for dst in 1..=trial.max_id {
-            if dst == thin { continue; }
-            let old_rew = trial.hero_rewards.get(&dst).copied().unwrap_or(0);
-            let route   = &trial.routes[&dst];
-            for pos in 0..=route.len() {
-                let mut nr  = route.clone();
-                nr.insert(pos, mill);
-                let new_rew = simulate_hero(dst, &nr, d);
-                let gain    = new_rew as i64 - old_rew as i64;
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_dst  = dst;
-                    best_pos  = pos;
-                }
-            }
-        }
-        if best_dst > 0 {
-            trial.routes.get_mut(&best_dst).unwrap().insert(best_pos, mill);
-            refresh_hero(&mut trial, best_dst, d);
-        }
-    }
-
-    // Renumber
-    for h in thin..trial.max_id {
-        let route  = trial.routes.remove(&(h + 1)).unwrap_or_default();
-        let reward = trial.hero_rewards.remove(&(h + 1)).unwrap_or(0);
-        trial.routes.insert(h, route);
-        trial.hero_rewards.insert(h, reward);
-    }
-    trial.max_id -= 1;
-    recompute(&mut trial, d);
-
-    // Accept if we gain (break-even: losing ≤4 mills is fine — save 2500, lose ≤2000)
-    // Threshold = -2000: accept even if we lose up to 4 mills worth of reward.
-    if trial.fitness.unwrap_or(i64::MIN) >= old_fit - 2000 {
-        return trial;
-    }
-    sol
 }
 
 // ─── CSV output ───────────────────────────────────────────────────────────────
 
 fn save_csv(sol: &Solution, path: &str) {
-    let mut f = File::create(path).expect("Cannot create output file");
+    let mut f = File::create(path).expect("cannot create output");
     writeln!(f, "hero_id,object_id").unwrap();
-    for hid in 1..=sol.max_id {
-        if let Some(r) = sol.routes.get(&hid) {
-            for &obj in r { writeln!(f, "{},{}", hid, obj).unwrap(); }
+    for r in &sol.routes {
+        for &obj in &r.mills {
+            writeln!(f, "{},{}", r.hero_id, obj).unwrap();
         }
     }
 }
 
 // ─── Genetic algorithm ────────────────────────────────────────────────────────
-//
-// Key design decisions:
-//
-// • 30% greedy + 70% random initial population → good diversity from start
-// • Two crossover strategies (60% day-aware / 40% hero-route) alternating
-// • day-order repair after every crossover
-// • Five mutation operators, applied once (+ 30% chance of a second pass)
-// • Adaptive mutation: rate scales up linearly with stagnation depth
-// • Or-opt local search (3 phases: intra, inter-move, inter-swap)
-// • Per-hero reward cache: local-search moves re-evaluate in O(route_len)
-// • Elite preservation: top `elite_ratio` of population survives unchanged
-// • Child generation is fully parallel via rayon; selection stays on main thread
-// • AtomicU64 counter drives per-generation progress bar with no lock contention
 
 fn genetic_algorithm(
     pop_size:          usize,
     generations:       usize,
-    elite_ratio:       f32,
+    elite_ratio:       f64,
     base_mut_rate:     f64,
-    ls_iter:           u32,   // or-opt iterations per individual
-    db_stag_threshold: usize, // stagnation gens before double-bridge kicks in
-    im_stag_threshold: usize, // stagnation gens before insert-missing kicks in
-    restart_threshold: usize, // stagnation gens before population restart
-    trim_threshold:    usize, // stagnation gens before hero trimming
+    ls_iter:           u32,
+    db_stag_threshold: usize,
+    im_stag_threshold: usize,
+    trim_threshold:    usize,
+    restart_threshold: usize,
     best_file:         &str,
+    checkpoints:       &[&str],
     d:                 &ProblemData,
     mp:                &MultiProgress,
 ) -> Solution {
-    // ── Init ─────────────────────────────────────────────────────────────
-    let mut pop        = init_population(pop_size, d, mp);
-    let elite_sz       = ((pop_size as f32 * elite_ratio) as usize).max(1);
-    let children_need  = pop_size - elite_sz;
+    let mut pop = init_population(pop_size, d, mp, checkpoints);
+    pop.sort_by_key(|s| std::cmp::Reverse(s.fitness));
 
-    pop.sort_by_key(|s| Reverse(s.fitness.unwrap_or(i64::MIN)));
-    let mut best = pop[0].clone();
-    save_csv(&best, best_file);
+    let elite_sz      = ((pop_size as f64 * elite_ratio) as usize).max(1);
+    let children_need = pop_size - elite_sz;
 
-    // ── Progress bars ─────────────────────────────────────────────────────
-    let gen_pb = mp.add(ProgressBar::new(generations as u64));
+    // Guard against best_file being overwritten with a worse solution on startup
+    let mut best = {
+        let init_best = pop[0].clone();
+        let file_best = load_checkpoint(best_file, d);
+        match file_best {
+            Some(fb) if fb.fitness > init_best.fitness => { fb }
+            _ => { save_csv(&init_best, best_file); init_best }
+        }
+    };
+
+    let gen_pb   = mp.add(ProgressBar::new(generations as u64));
     gen_pb.set_style(gen_bar_style());
-    gen_pb.set_message(best.fitness.unwrap_or(0).to_string());
+    gen_pb.set_message(best.fitness.to_string());
 
     let child_pb = mp.add(ProgressBar::new(children_need as u64));
     child_pb.set_style(bar_style());
 
-    let counter = Arc::new(AtomicU64::new(0));
-
-    // Progress bars for the three post-processing phases
-    let post_pb = mp.add(ProgressBar::new(1));
+    let post_pb  = mp.add(ProgressBar::new(1));
     post_pb.set_style(post_bar_style());
-    post_pb.set_message("waiting…");
 
-    // ── Adaptive mutation + phase timing state ───────────────────────────────
-    let mut stagnation       = 0usize;
-    let mut last_best        = best.fitness.unwrap_or(i64::MIN);
-    let mut rng              = rand::thread_rng();
-    let run_start            = Instant::now();
+    let counter   = Arc::new(AtomicU64::new(0));
+    let mut stag  = 0usize;
+    let mut last  = best.fitness;
+    let mut rng   = rand::thread_rng();
+    let run_start = Instant::now();
 
-    // Profiling accumulators (nanoseconds)
-    let mut t_selection:  u128 = 0;
-    let mut t_crossover:  u128 = 0;
-    let mut t_or_opt:     u128 = 0;
-    let mut t_db:         u128 = 0;
-    let mut t_im:         u128 = 0;
-    let mut t_restart:    u128 = 0;
-    let mut db_triggers:   usize = 0;
-    let mut im_triggers:   usize = 0;
-    let mut restart_count: usize = 0;
-    let mut t_trim:        u128  = 0;
-    let mut trim_count:    usize = 0;
+    // Profiling
+    let (mut t_xover, mut t_oropt, mut t_db, mut t_im, mut t_trim, mut t_restart): (u128,u128,u128,u128,u128,u128) = Default::default();
+    let (mut n_db, mut n_im, mut n_trim, mut n_restart): (usize,usize,usize,usize) = Default::default();
 
     for generation in 0..generations {
-        // Mutation rate grows with stagnation (caps at 0.95)
-        let mut_rate = (base_mut_rate * (1.0 + stagnation as f64 * 0.1)).min(0.95);
+        let mut_rate = (base_mut_rate * (1.0 + stag as f64 * 0.08)).min(0.90);
 
-        // ── Reset child bar ────────────────────────────────────────────────
         child_pb.reset();
         child_pb.set_length(children_need as u64);
         child_pb.set_message(format!(
-            "Gen {:>4}/{}  mut={:.2}  stag={}", generation + 1, generations, mut_rate, stagnation
+            "Gen {:>4}/{}  mut={:.2}  stag={}", generation+1, generations, mut_rate, stag
         ));
         counter.store(0, Ordering::Relaxed);
 
-        // ── Selection on main thread (needs &mut rng) ─────────────────────
-        let t0 = Instant::now();
-        let pairs: Vec<(Solution, Solution)> = (0..children_need)
-            .map(|_| {
-                let p1 = tournament(&pop, 5, &mut rng).clone();
-                let p2 = tournament(&pop, 5, &mut rng).clone();
-                (p1, p2)
-            })
-            .collect();
-        t_selection += t0.elapsed().as_nanos();
+        let pairs: Vec<(Solution, Solution)> = (0..children_need).map(|_| {
+            let p1 = tournament(&pop, 5, &mut rng).clone();
+            let p2 = tournament(&pop, 5, &mut rng).clone();
+            (p1, p2)
+        }).collect();
 
-        // ── Parallel child generation ──────────────────────────────────────
-        let cnt_ref = Arc::clone(&counter);
-        let cpb_ref = &child_pb;
-
-        // Per-thread timing accumulators — folded into outer counters after collect
-        // AtomicU64 is stable and holds up to ~584 years of nanoseconds.
-        let par_t_xover  = Arc::new(AtomicU64::new(0));
-        let par_t_oropt  = Arc::new(AtomicU64::new(0));
-        let xover_ref    = Arc::clone(&par_t_xover);
-        let oropt_ref    = Arc::clone(&par_t_oropt);
+        let cnt_ref  = Arc::clone(&counter);
+        let cpb_ref  = &child_pb;
+        let t_x_acc  = Arc::new(AtomicU64::new(0));
+        let t_o_acc  = Arc::new(AtomicU64::new(0));
+        let tx2 = Arc::clone(&t_x_acc);
+        let to2 = Arc::clone(&t_o_acc);
 
         let mut children: Vec<Solution> = pairs
             .into_par_iter()
@@ -1236,141 +1050,105 @@ fn genetic_algorithm(
                 let mut rng = rand::thread_rng();
 
                 let tc = Instant::now();
-                let mut child = if rng.gen_bool(0.6) {
-                    day_crossover(&p1, &p2, d, &mut rng)
-                } else {
-                    hero_crossover(&p1, &p2, d, &mut rng)
-                };
-                child = repair_order(child, d);
-                if rng.gen_bool(mut_rate)       { child = mutate(child, d); }
-                if rng.gen_bool(mut_rate * 0.3) { child = mutate(child, d); }
-                xover_ref.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let mut child = crossover(&p1, &p2, d, &mut rng);
+                if rng.gen_bool(mut_rate) { child = mutate(child, d, &mut rng); }
+                if rng.gen_bool(mut_rate * 0.3) { child = mutate(child, d, &mut rng); }
+                tx2.fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                 let to = Instant::now();
                 child = or_opt(child, ls_iter, d);
-                oropt_ref.fetch_add(to.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                to2.fetch_add(to.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                let prev = cnt_ref.fetch_add(1, Ordering::Relaxed);
-                cpb_ref.set_position(prev + 1);
+                cnt_ref.fetch_add(1, Ordering::Relaxed);
+                cpb_ref.set_position(cnt_ref.load(Ordering::Relaxed));
                 child
             })
             .collect();
-        t_crossover += par_t_xover.load(Ordering::Relaxed) as u128;
-        t_or_opt    += par_t_oropt.load(Ordering::Relaxed) as u128;
 
-        // ── Assemble next generation ───────────────────────────────────────
-        pop.sort_by_key(|s| Reverse(s.fitness.unwrap_or(i64::MIN)));
-        let mut next: Vec<Solution> = pop[..elite_sz].to_vec(); // elites unchanged
+        t_xover += t_x_acc.load(Ordering::Relaxed) as u128;
+        t_oropt += t_o_acc.load(Ordering::Relaxed) as u128;
+
+        pop.sort_by_key(|s| std::cmp::Reverse(s.fitness));
+        let mut next = pop[..elite_sz].to_vec();
         next.append(&mut children);
         pop = next;
 
-        // ── Double-bridge perturbation (applied to every child when stagnating) ─
-        if stagnation >= db_stag_threshold {
-            let tdb = Instant::now();
-            db_triggers += 1;
+        // ── Double-bridge ─────────────────────────────────────────────────
+        if stag >= db_stag_threshold {
+            let t = Instant::now();
+            n_db += 1;
+            post_pb.reset();
+            post_pb.set_length(pop.len() as u64);
+            post_pb.set_message(format!("double-bridge  stag={stag}"));
             let cnt2 = Arc::clone(&counter);
-            let pb2  = &post_pb;
-            pb2.reset();
-            pb2.set_length(pop.len() as u64);
-            pb2.set_message(format!("double-bridge  stag={stagnation}"));
-
-            pop = pop
-                .into_par_iter()
-                .map(|sol| {
-                    let mut rng = rand::thread_rng();
-                    let sol = double_bridge(sol, d, &mut rng);
-                    let sol = or_opt(sol, ls_iter, d);
-                    cnt2.fetch_add(1, Ordering::Relaxed);
-                    pb2.set_position(cnt2.load(Ordering::Relaxed));
-                    sol
-                })
-                .collect();
-            pb2.finish_with_message(format!("✓ double-bridge #{db_triggers} done"));
-            t_db += tdb.elapsed().as_nanos();
+            counter.store(0, Ordering::Relaxed);
+            pop = pop.into_par_iter().map(|sol| {
+                let mut rng = rand::thread_rng();
+                let sol = double_bridge(sol, d, &mut rng);
+                let sol = or_opt(sol, ls_iter, d);
+                cnt2.fetch_add(1, Ordering::Relaxed);
+                post_pb.set_position(cnt2.load(Ordering::Relaxed));
+                sol
+            }).collect();
+            post_pb.finish_with_message(format!("✓ double-bridge #{n_db}"));
+            t_db += t.elapsed().as_nanos();
         }
 
-        // ── Insert-missing-mills pass (triggered on its own threshold) ─────
-        if stagnation >= im_stag_threshold {
-            let tim = Instant::now();
-            im_triggers += 1;
-            // Apply to the current best individual only (most worth polishing)
-            pop.sort_by_key(|s| Reverse(s.fitness.unwrap_or(i64::MIN)));
+        // ── Insert-missing on best individual ─────────────────────────────
+        if stag >= im_stag_threshold {
+            let t = Instant::now();
+            n_im += 1;
+            pop.sort_by_key(|s| std::cmp::Reverse(s.fitness));
             let top = pop.remove(0);
             let top = insert_missing_mills(top, d, &post_pb);
-            let top = or_opt(top, ls_iter * 2, d); // extra polish after insertion
+            let top = or_opt(top, ls_iter * 2, d);
             pop.insert(0, top);
-            t_im += tim.elapsed().as_nanos();
+            t_im += t.elapsed().as_nanos();
         }
 
-        // ── Trim unprofitable heroes ──────────────────────────────────────
-        // A hero who earns less gold than their hire cost (2500) is a net
-        // negative.  Removing them and redistributing their mills to the
-        // remaining heroes often both raises fitness and frees up a hero slot
-        // for the mutation operator to try a more useful configuration.
-        if stagnation >= trim_threshold {
-            let tt = Instant::now();
-            trim_count += 1;
+        // ── Trim + aggressive merge ───────────────────────────────────────
+        if stag >= trim_threshold {
+            let t = Instant::now();
+            n_trim += 1;
             post_pb.reset();
-            post_pb.set_length(pop_size as u64);
-            post_pb.set_message(format!("trim+merge  stag={stagnation}"));
-
-            // Phase A: trim heroes earning < hire_cost from every individual
-            pop = pop
-                .into_par_iter()
-                .map(|sol| {
-                    let mut rng = rand::thread_rng();
-                    let sol = trim_unprofitable_heroes(sol, d, &mut rng);
-                    post_pb.inc(1);
-                    sol
-                })
-                .collect();
-
-            // Phase B: aggressive_merge on the entire population — try to
-            // squeeze one more hero out even at a small reward cost.
-            // Each individual is processed independently → fully parallel.
-            post_pb.reset();
-            post_pb.set_length(pop_size as u64);
-            post_pb.set_message(format!("aggressive-merge  stag={stagnation}"));
-            pop = pop
-                .into_par_iter()
-                .map(|sol| {
-                    let sol = aggressive_merge(sol, d);
-                    // Follow with or-opt to absorb gains from the merge
-                    let sol = or_opt(sol, ls_iter, d);
-                    post_pb.inc(1);
-                    sol
-                })
-                .collect();
-
-            post_pb.finish_with_message(format!("✓ trim+merge #{trim_count} done"));
-            t_trim += tt.elapsed().as_nanos();
+            post_pb.set_length(pop.len() as u64);
+            post_pb.set_message(format!("trim+merge  stag={stag}"));
+            pop = pop.into_par_iter().map(|sol| {
+                let mut rng = rand::thread_rng();
+                let sol = trim_unprofitable(sol, d, &mut rng);
+                let sol = aggressive_merge(sol, d);
+                let sol = or_opt(sol, ls_iter, d);
+                post_pb.inc(1);
+                sol
+            }).collect();
+            post_pb.finish_with_message(format!("✓ trim+merge #{n_trim}"));
+            t_trim += t.elapsed().as_nanos();
         }
 
-        // ── Population restart (hardest reset — triggered last) ───────────
-        if stagnation >= restart_threshold {
-            let tr = Instant::now();
-            restart_count += 1;
+        // ── Population restart ────────────────────────────────────────────
+        if stag >= restart_threshold {
+            let t = Instant::now();
+            n_restart += 1;
             pop = restart_population(pop, d, ls_iter, &post_pb);
-            stagnation = 0; // explicit reset so we don't immediately retrigger
-            t_restart += tr.elapsed().as_nanos();
+            stag = 0;
+            t_restart += t.elapsed().as_nanos();
         }
 
-        // ── Track global best ──────────────────────────────────────────────
-        if let Some(cur) = pop.iter().max_by_key(|s| s.fitness.unwrap_or(i64::MIN)) {
+        // ── Track global best ─────────────────────────────────────────────
+        if let Some(cur) = pop.iter().max_by_key(|s| s.fitness) {
             if cur.fitness > best.fitness {
                 best = cur.clone();
                 save_csv(&best, best_file);
             }
         }
-        let cur_best = best.fitness.unwrap_or(i64::MIN);
-        if cur_best > last_best { last_best = cur_best; stagnation = 0; }
-        else                    { stagnation += 1; }
+        if best.fitness > last { last = best.fitness; stag = 0; }
+        else                   { stag += 1; }
 
-        // ── Update generation bar ──────────────────────────────────────────
         let e = run_start.elapsed().as_secs();
         gen_pb.set_message(format!(
-            "{}  [{:02}:{:02}:{:02}]  heroes={}",
-            cur_best, e/3600, (e%3600)/60, e%60, best.max_id
+            "{}  [{:02}:{:02}:{:02}]  heroes={}  mills={}",
+            best.fitness, e/3600, (e%3600)/60, e%60, best.routes.len(),
+            best.routes.iter().map(|r| r.mills.len()).sum::<usize>()
         ));
         gen_pb.inc(1);
     }
@@ -1378,28 +1156,26 @@ fn genetic_algorithm(
     child_pb.finish_and_clear();
     post_pb.finish_and_clear();
     gen_pb.finish_with_message(format!(
-        "✓ Done  fitness={}  heroes={}",
-        best.fitness.unwrap_or(0), best.max_id
+        "✓ Done  fitness={}  heroes={}  mills={}",
+        best.fitness, best.routes.len(),
+        best.routes.iter().map(|r| r.mills.len()).sum::<usize>()
     ));
 
-    // ── Phase timing report ──────────────────────────────────────────────
-    let total_ns = (t_selection + t_crossover + t_or_opt + t_db + t_im + t_trim + t_restart).max(1);
-    eprintln!("\n─── Phase timing ────────────────────────────────");
-    eprintln!("  selection   {:>8.2}s  ({:>5.1}%)",
-        t_selection  as f64 / 1e9, t_selection  as f64 / total_ns as f64 * 100.0);
-    eprintln!("  crossover   {:>8.2}s  ({:>5.1}%)",
-        t_crossover  as f64 / 1e9, t_crossover  as f64 / total_ns as f64 * 100.0);
-    eprintln!("  or-opt      {:>8.2}s  ({:>5.1}%)",
-        t_or_opt     as f64 / 1e9, t_or_opt     as f64 / total_ns as f64 * 100.0);
-    eprintln!("  dbl-bridge  {:>8.2}s  ({:>5.1}%)  triggered {} times",
-        t_db         as f64 / 1e9, t_db         as f64 / total_ns as f64 * 100.0, db_triggers);
-    eprintln!("  ins-missing {:>8.2}s  ({:>5.1}%)  triggered {} times",
-        t_im         as f64 / 1e9, t_im         as f64 / total_ns as f64 * 100.0, im_triggers);
-    eprintln!("  trim-heroes {:>8.2}s  ({:>5.1}%)  triggered {} times",
-        t_trim       as f64 / 1e9, t_trim       as f64 / total_ns as f64 * 100.0, trim_count);
-    eprintln!("  restart     {:>8.2}s  ({:>5.1}%)  triggered {} times",
-        t_restart    as f64 / 1e9, t_restart    as f64 / total_ns as f64 * 100.0, restart_count);
-    eprintln!("─────────────────────────────────────────────────\n");
+    let total = (t_xover + t_oropt + t_db + t_im + t_trim + t_restart).max(1);
+    eprintln!("\n─── Phase timing ─────────────────────────────────");
+    for (name, t, n) in [
+        ("crossover  ", t_xover,   0usize),
+        ("or-opt     ", t_oropt,   0),
+        ("dbl-bridge ", t_db,      n_db),
+        ("ins-missing", t_im,      n_im),
+        ("trim+merge ", t_trim,    n_trim),
+        ("restart    ", t_restart, n_restart),
+    ] {
+        eprintln!("  {name} {:>8.1}s  ({:>5.1}%)  {}",
+            t as f64 / 1e9, t as f64 / total as f64 * 100.0,
+            if n > 0 { format!("× {n}") } else { String::new() });
+    }
+    eprintln!("──────────────────────────────────────────────────\n");
 
     best
 }
@@ -1410,20 +1186,18 @@ fn main() {
     let mp   = MultiProgress::new();
     let data = load_data(&mp);
 
-    // Uncomment to pin thread count (default = logical CPU count):
-    // rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
-
     let best = genetic_algorithm(
         /* pop_size          */ 200,
         /* generations       */ 500,
-        /* elite_ratio       */ 0.10,  // keep top 10%
+        /* elite_ratio       */ 0.10,
         /* base_mut_rate     */ 0.40,
-        /* ls_iter           */ 8,     // or-opt passes per individual
-        /* db_stag_threshold */ 15,    // double-bridge after 15 stagnant gens
-        /* im_stag_threshold */ 20,    // insert-missing after 20 stagnant gens
-        /* restart_threshold */ 60,    // population restart after 60 stagnant gens
-        /* trim_threshold    */ 20,    // trim+aggressive-merge after 20 stagnant gens
+        /* ls_iter           */ 8,
+        /* db_stag_threshold */ 15,
+        /* im_stag_threshold */ 20,
+        /* trim_threshold    */ 40,
+        /* restart_threshold */ 60,
         /* best_file         */ "best.csv",
+        /* checkpoints       */ &["submission.csv"],
         &data,
         &mp,
     );
@@ -1431,9 +1205,12 @@ fn main() {
     save_csv(&best, "final.csv");
     drop(mp);
 
-    println!("\nFinal fitness  : {}", best.fitness.unwrap_or(0));
-    println!("Heroes used    : {}", best.max_id);
-    println!("Gold collected : {}",
-        best.fitness.unwrap_or(0) + best.max_id as i64 * HERO_COST as i64);
+    let gross = best.fitness + best.routes.len() as i64 * HERO_COST as i64;
+    let mills: usize = best.routes.iter().map(|r| r.mills.len()).sum();
+    println!("\nFinal fitness  : {}", best.fitness);
+    println!("Heroes used    : {}", best.routes.len());
+    println!("Mills visited  : {}/700", mills);
+    println!("Gross reward   : {gross}");
+    println!("Hero cost      : {}", best.routes.len() as i64 * HERO_COST as i64);
     println!("Saved to       : final.csv");
 }

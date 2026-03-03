@@ -1,22 +1,20 @@
 # ---------- Build stage ----------
-FROM rust:1.71 as builder
+FROM rust:latest AS builder
 
 WORKDIR /app
 
-# Copy manifest first for dependency caching
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
-# Create dummy main.rs to cache dependencies
+# Cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-
 RUN cargo build --release
 RUN rm -rf src
 
-# Copy real source code (main.rs only, parallel ignored via .dockerignore)
+# Copy real source
 COPY src ./src
 COPY *.csv ./
 
-# Build release binary
+# Final build
 RUN cargo build --release
 
 
@@ -25,14 +23,9 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install minimal runtime deps
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Copy binary
-COPY --from=builder /app/target/release/* ./
-
-# Copy CSV files
+COPY --from=builder /app/target/release/rusty_GA ./rusty_GA
 COPY *.csv ./
 
-# Run app
-CMD ["./main"]
+CMD ["./rusty_GA"]
