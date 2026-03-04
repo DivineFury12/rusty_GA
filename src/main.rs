@@ -887,44 +887,44 @@ fn trim_unprofitable(mut sol: Solution, d: &ProblemData, rng: &mut impl Rng) -> 
 // Tries to merge the thinnest route into others using best-fit insertion.
 // Accepts only if net fitness strictly improves (saves HERO_COST, must offset any loss).
 
-fn aggressive_merge(mut sol: Solution, d: &ProblemData) -> Solution {
+fn aggressive_merge(sol: Solution, d: &ProblemData) -> Solution {
     if sol.routes.len() <= 1 { return sol; }
 
     let thin_idx = sol.routes.iter().enumerate()
         .min_by_key(|(_, r)| r.mills.len()).map(|(i, _)| i).unwrap();
 
-    let old_fit  = sol.fitness;
-    let orphans  = sol.routes[thin_idx].mills.clone();
-    let old_rew  = sol.routes[thin_idx].reward as i64;
+    let old_fit = sol.fitness;
+    let orphans = sol.routes[thin_idx].mills.clone();
+    let old_rew = sol.routes[thin_idx].reward as i64;
 
-    // Tentatively remove
-    sol.fitness -= old_rew + HERO_COST as i64;
-    sol.routes.swap_remove(thin_idx);
+    // Work on a clone so the original is untouched if we reject.
+    // This is the critical fix: the old code mutated `sol` in-place then set
+    // sol.fitness = old_fit on rejection, returning routes that didn't match
+    // the claimed fitness value — causing fitness to drift upward each call.
+    let mut trial = sol.clone();
+    trial.fitness -= old_rew + HERO_COST as i64;
+    trial.routes.swap_remove(thin_idx);
 
     for mill in &orphans {
         let mut best_gain = i64::MIN;
         let mut best_ri   = 0usize;
         let mut best_pos  = 0usize;
-        for ri in 0..sol.routes.len() {
-            let or = sol.routes[ri].reward;
-            for pos in 0..=sol.routes[ri].mills.len() {
-                let mut nr = sol.routes[ri].mills.clone();
+        for ri in 0..trial.routes.len() {
+            let or = trial.routes[ri].reward;
+            for pos in 0..=trial.routes[ri].mills.len() {
+                let mut nr = trial.routes[ri].mills.clone();
                 nr.insert(pos, *mill);
-                let nr_rew = simulate_hero(sol.routes[ri].hero_id, &nr, d);
+                let nr_rew = simulate_hero(trial.routes[ri].hero_id, &nr, d);
                 let gain   = nr_rew as i64 - or as i64;
                 if gain > best_gain { best_gain = gain; best_ri = ri; best_pos = pos; }
             }
         }
-        sol.routes[best_ri].mills.insert(best_pos, *mill);
-        refresh_route(&mut sol, best_ri, d);
+        trial.routes[best_ri].mills.insert(best_pos, *mill);
+        refresh_route(&mut trial, best_ri, d);
     }
 
-    if sol.fitness > old_fit { sol } else {
-        // Undo: rebuild original (recompute is cheaper than reversing swap_remove)
-        // Caller keeps original on rejection
-        sol.fitness = old_fit; // signal rejection; caller will discard
-        sol
-    }
+    // Accept only if strictly better; otherwise return the original untouched.
+    if trial.fitness > old_fit { trial } else { sol }
 }
 
 // ─── Population restart ───────────────────────────────────────────────────────
@@ -991,15 +991,19 @@ fn genetic_algorithm(
     let elite_sz      = ((pop_size as f64 * elite_ratio) as usize).max(1);
     let children_need = pop_size - elite_sz;
 
-    // Guard against best_file being overwritten with a worse solution on startup
+    // Guard against best_file being overwritten with a worse solution on startup.
+    // Always recompute fitness from simulate_hero so no stale value from a
+    // prior buggy run can carry over through the checkpoint file.
     let mut best = {
         let init_best = pop[0].clone();
-        let file_best = load_checkpoint(best_file, d);
+        let file_best = load_checkpoint(best_file, d); // rewards already fresh-computed inside
         match file_best {
             Some(fb) if fb.fitness > init_best.fitness => { fb }
             _ => { save_csv(&init_best, best_file); init_best }
         }
     };
+    // Verify best fitness by full recompute — catches any drift in loaded solution.
+    recompute(&mut best, d);
 
     let gen_pb   = mp.add(ProgressBar::new(generations as u64));
     gen_pb.set_style(gen_bar_style());
@@ -1091,6 +1095,7 @@ fn genetic_algorithm(
                 sol
             }).collect();
             post_pb.finish_with_message(format!("✓ double-bridge #{n_db}"));
+            pop.iter_mut().for_each(|s| recompute(s, d));
             t_db += t.elapsed().as_nanos();
         }
 
@@ -1122,6 +1127,9 @@ fn genetic_algorithm(
                 sol
             }).collect();
             post_pb.finish_with_message(format!("✓ trim+merge #{n_trim}"));
+            // Safety recompute: rebuild every fitness value from scratch so any
+            // residual delta-drift is eliminated before tournament selection.
+            pop.iter_mut().for_each(|s| recompute(s, d));
             t_trim += t.elapsed().as_nanos();
         }
 
@@ -1197,7 +1205,7 @@ fn main() {
         /* trim_threshold    */ 40,
         /* restart_threshold */ 60,
         /* best_file         */ "best.csv",
-        /* checkpoints       */ &["submission.csv"],
+        /* checkpoints       */ &["best.csv"],
         &data,
         &mp,
     );
